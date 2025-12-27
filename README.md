@@ -5,7 +5,7 @@
 ![PyTorch](https://img.shields.io/badge/PyTorch-Deep%20Learning-orange?logo=pytorch)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-**RT-XNIDS** is a lightweight, real-time cybersecurity monitoring tool that uses Deep Learning to detect network attacks and Explainable AI (SHAP) to tell you *why* an attack was flagged. 
+**RT-XNIDS** is a lightweight, real-time cybersecurity monitoring tool that uses Deep Learning to detect network attacks and Explainable AI to tell you *why* an attack was flagged. 
 ---
 
 ## Project Preview
