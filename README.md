@@ -147,7 +147,3 @@ This project is for **Educational and Research Purposes Only**.
 
 * Do not use this system to monitor networks without authorization.
 * The authors are not responsible for any misuse of this tool.
-
----
-
-*Built for the Computer Security Term Paper (Fall 2025)*
