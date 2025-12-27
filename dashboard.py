@@ -197,120 +197,128 @@ with st.sidebar:
     st.divider()
     st.markdown(":material/check_circle: System Status: **Active**")
 
-# 6. Main Loop Setup
-placeholder = st.empty()
+# 6. Main Logic (Replaced 'while True' with st.rerun pattern)
+df_raw = load_data()
 
-while True:
-    df_raw = load_data()
+# 1. Apply Logic Filters
+if not df_raw.empty:
+    df = df_raw[df_raw['Confidence'].astype(float) >= confidence_threshold]
+else:
+    df = df_raw.copy()
+
+# 2. Apply Vector Filter
+if not df.empty and selected_vectors:
+    df = df[df['AttackReason'].isin(selected_vectors)]
+
+# 3. Sort and Limit for View
+if not df.empty:
+    df_sorted = df.sort_index(ascending=False).head(history_depth)
+else:
+    df_sorted = pd.DataFrame(columns=["Timestamp", "SrcIP", "DstIP", "Confidence", "AttackReason", "ImpactScore"])
+
+# --- UI Rendering ---
+
+# Header
+st.markdown("""
+<h1 style="font-size: 1.5rem; font-weight: 600; letter-spacing: -0.05em; margin-bottom: 2rem; color: #fafafa;">Network Security Monitor</h1>
+""", unsafe_allow_html=True)
+
+# System Status Metrics
+stats = load_system_stats()
+m1, m2, m3, m4 = st.columns(4)
+m1.metric(label=":material/dns: System Mode", value=stats["mode"])
+m2.metric(label=":material/check_circle: Accuracy", value=stats["accuracy"])
+m3.metric(label=":material/speed: Avg Latency", value=f"{stats['latency']} ms")
+m4.metric(label=":material/query_stats: Processed Flows", value=f"{stats['total']:,}")
+
+st.markdown("<div style='height: 1rem; border-bottom: 1px solid #27272a; margin-bottom: 2rem;'></div>", unsafe_allow_html=True)
+
+# --- 🔎 INCIDENT INSPECTOR (Interactive Forensic Tool) ---
+if not df_sorted.empty:
+    st.subheader(":material/search: Forensic Analysis")
     
-    # --- Logic: Apply Filters ---
-    # 1. Filter by Confidence
-    if not df_raw.empty:
-        df = df_raw[df_raw['Confidence'].astype(float) >= confidence_threshold]
-    else:
-        df = df_raw.copy()
-        
-    # 2. Filter by Attack Vector
-    if not df.empty and selected_vectors:
-        df = df[df['AttackReason'].isin(selected_vectors)]
+    # Create unique labels for selection
+    df_sorted['Label'] = df_sorted.apply(
+        lambda x: f"{x['Timestamp'].split(' ')[1] if ' ' in x['Timestamp'] else x['Timestamp']} | {x['SrcIP']} -> {x['DstIP']} | {x['AttackReason']}", 
+        axis=1
+    )
+    
+    c_sel, c_why = st.columns([1, 2])
+    
+    with c_sel:
+        selected_alert_label = st.selectbox(
+            "Select Alert to Investigate:",
+            options=df_sorted['Label'].tolist(),
+            index=0  # Latest by default
+        )
+    
+    # Find selected row
+    selected_row = df_sorted[df_sorted['Label'] == selected_alert_label].iloc[0]
+    
+    with c_why:
+        explanation = get_human_explanation(
+            selected_row['AttackReason'], 
+            selected_row['AttackReason'], 
+            selected_row['Confidence']
+        )
+        st.info(f"**Analysis of {selected_row['SrcIP']}**: {explanation}", icon=":material/lightbulb:")
 
-    # 3. Sort and Limit for "Recent Alerts" table
+st.divider()
+
+# Total Threats Metrics
+total_threats = len(df)
+if not df.empty:
+    # Use global df for metrics/cards
+    last_target = df.iloc[-1]['DstIP']
+    top_vector = df['AttackReason'].mode()[0] if not df['AttackReason'].empty else "N/A"
+    high_conf = len(df[df['Confidence'] > 0.9])
+    
+    try:
+        last_ts = df.iloc[-1]['Timestamp'].split(' ')[1]
+    except:
+        last_ts = "N/A"
+else:
+    last_target = "Safe"
+    top_vector = "None"
+    high_conf = 0
+    last_ts = "--:--"
+    
+# Cards
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.markdown(card("Total Threats", str(total_threats), f"{high_conf} Critical", ICON_SHIELD), unsafe_allow_html=True)
+with c2:
+    st.markdown(card("Active Target", last_target, f"Last: {last_ts}", ICON_TARGET), unsafe_allow_html=True)
+with c3:
+    st.markdown(card("Top Vector", top_vector, "Most Frequent", ICON_ACTIVITY), unsafe_allow_html=True)
+    
+st.markdown("<div style='height: 2rem;'></div>", unsafe_allow_html=True)
+
+# Main Content: Feed & Charts
+c_table, c_chart = st.columns([2, 1])
+
+with c_table:
+    st.markdown(f"### Live Threat Feed (Last {history_depth})")
+    table_html = generate_html_table(df_sorted)
+    st.markdown(table_html, unsafe_allow_html=True)
+    
+with c_chart:
+    st.markdown("### Attack Distribution")
     if not df.empty:
-        df_sorted = df.sort_index(ascending=False).head(history_depth)
+        chart = alt.Chart(df).mark_arc(innerRadius=60).encode(
+            theta=alt.Theta("count()", stack=True),
+            color=alt.Color("AttackReason", scale={'scheme': 'reds'}, legend=alt.Legend(orient="bottom", title=None, labelColor="#a1a1aa")),
+            tooltip=["AttackReason", "count()"]
+        ).properties(
+            height=300,
+            background='transparent'
+        ).configure_view(
+            strokeWidth=0
+        )
+        st.altair_chart(chart, use_container_width=True)
     else:
-        df_sorted = pd.DataFrame(columns=["Timestamp", "SrcIP", "DstIP", "Confidence", "AttackReason"])
+        st.markdown("<div style='color: #a1a1aa; font-size: 0.875rem;'>Waiting for data...</div>", unsafe_allow_html=True)
 
-    with placeholder.container():
-        # Header
-        st.markdown("""
-            <h1 style="
-                font-size: 1.5rem; 
-                font-weight: 600; 
-                letter-spacing: -0.05em; 
-                margin-bottom: 2rem; 
-                color: #fafafa;
-            ">Network Security Monitor</h1>
-        """, unsafe_allow_html=True)
-        
-        # --- System Status Metrics ---
-        stats = load_system_stats()
-        with st.container():
-            m1, m2, m3, m4 = st.columns(4)
-            with m1:
-                st.metric(label=":material/dns: System Mode", value=stats["mode"])
-            with m2:
-                st.metric(label=":material/check_circle: Accuracy", value=stats["accuracy"])
-            with m3:
-                st.metric(label=":material/speed: Avg Latency", value=f"{stats['latency']} ms")
-            with m4:
-                st.metric(label=":material/query_stats: Processed Flows", value=f"{stats['total']:,}")
-        
-        st.markdown("<div style='height: 1rem; border-bottom: 1px solid #27272a; margin-bottom: 2rem;'></div>", unsafe_allow_html=True)
-
-        # --- Non-Technical Explainability ---
-        if not df.empty:
-            latest_threat = df.iloc[-1]
-            explanation = get_human_explanation(
-                latest_threat['AttackReason'], 
-                latest_threat['AttackReason'], 
-                latest_threat['Confidence']
-            )
-            
-            st.info(f"**Why did the AI block this?** (Threshold: {confidence_threshold:.2f})\n\n {explanation}", icon=":material/lightbulb:")
-            st.markdown("<div style='height: 1rem;'></div>", unsafe_allow_html=True)
-
-        # Metrics
-        total_threats = len(df)
-        if not df.empty:
-            last_target = df.iloc[-1]['DstIP']
-            top_vector = df['AttackReason'].mode()[0] if not df['AttackReason'].empty else "N/A"
-            high_conf = len(df[df['Confidence'] > 0.9])
-            
-            try:
-                last_ts = df.iloc[-1]['Timestamp'].split(' ')[1]
-            except:
-                last_ts = "N/A"
-        else:
-            last_target = "Safe"
-            top_vector = "None"
-            high_conf = 0
-            last_ts = "--:--"
-            
-        # Cards
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown(card("Total Threats", str(total_threats), f"{high_conf} Critical", ICON_SHIELD), unsafe_allow_html=True)
-        with c2:
-            st.markdown(card("Active Target", last_target, f"Last: {last_ts}", ICON_TARGET), unsafe_allow_html=True)
-        with c3:
-            st.markdown(card("Top Vector", top_vector, "Most Frequent", ICON_ACTIVITY), unsafe_allow_html=True)
-            
-        st.markdown("<div style='height: 2rem;'></div>", unsafe_allow_html=True)
-        
-        # Main Content
-        c_table, c_chart = st.columns([2, 1])
-        
-        with c_table:
-            st.markdown(f"<h3 style='font-size: 1rem; font-weight: 500; color: #fafafa; margin-bottom: 1rem;'>Live Threat Feed (Last {history_depth})</h3>", unsafe_allow_html=True)
-            table_html = generate_html_table(df_sorted)
-            st.markdown(table_html, unsafe_allow_html=True)
-            
-        with c_chart:
-            st.markdown("<h3 style='font-size: 1rem; font-weight: 500; color: #fafafa; margin-bottom: 1rem;'>Attack Distribution</h3>", unsafe_allow_html=True)
-            if not df.empty:
-                chart = alt.Chart(df).mark_arc(innerRadius=60).encode(
-                    theta=alt.Theta("count()", stack=True),
-                    color=alt.Color("AttackReason", scale={'scheme': 'reds'}, legend=alt.Legend(orient="bottom", title=None, labelColor="#a1a1aa")),
-                    tooltip=["AttackReason", "count()"]
-                ).properties(
-                    height=300,
-                    background='transparent'
-                ).configure_view(
-                    strokeWidth=0
-                )
-                
-                st.altair_chart(chart)
-            else:
-                st.markdown("<div style='color: #a1a1aa; font-size: 0.875rem;'>Waiting for data...</div>", unsafe_allow_html=True)
-    
-    time.sleep(refresh_rate)
+# Auto-refresh logic
+time.sleep(refresh_rate)
+st.rerun()
