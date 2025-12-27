@@ -9,6 +9,7 @@ import shap
 import pandas as pd
 import csv
 import os
+import json
 from collections import defaultdict
 from scapy.all import sniff, IP, TCP, UDP
 from colorama import Fore, Style, init
@@ -20,6 +21,10 @@ init()
 LOG_FILE = "alerts.log"
 MODEL_PATH = "nids_model.pth"
 SCALER_PATH = "scaler.pkl"
+
+# --- Fine-Tuning (FP Reduction) ---
+MIN_CONFIDENCE = 0.60
+WHITELIST_IPS = ["127.0.0.1", "192.168.1.1"]
 
 # --- Model Definition ---
 class NIDSModel(nn.Module):
@@ -63,9 +68,9 @@ try:
             writer = csv.writer(f)
             writer.writerow(["Timestamp", "SrcIP", "DstIP", "Confidence", "AttackReason", "ImpactScore"])
     
-    print("✅ System Ready. Waiting for packets...")
+    print("System Ready. Waiting for packets...")
 except Exception as e:
-    print(f"❌ Error loading artifacts: {e}")
+    print(f"Error loading artifacts: {e}")
     exit(1)
 
 
@@ -152,7 +157,14 @@ def packet_callback(pkt):
             else:
                 active_flows[key] = Flow(pkt)
 
+# --- Global Tracking ---
+total_flows = 0
+total_latency = 0
+malicious_count = 0
+STATS_FILE = "live_stats.json"
+
 def reporter():
+    global total_flows, total_latency, malicious_count
     while True:
         time.sleep(1) # Check frequently
         with flow_lock:
@@ -173,15 +185,31 @@ def reporter():
                         X_scaled = scaler.transform(X)
                         X_tensor = torch.FloatTensor(X_scaled)
                         
+                        start_time_inf = time.time()
                         with torch.no_grad():
                             output = model(X_tensor)
                             prob = output.item()
+                        end_time_inf = time.time()
                         
-                        # --- FORCE ALERT LOGIC ---
-                        # Alert if AI says malicious (>0.5) OR if traffic volume is suspiciously high (>20 packets)
-                        if prob > 0.5 or f['total_fwd_packets'] > 20:
+                        total_flows += 1
+                        total_latency += (end_time_inf - start_time_inf)
+                        
+                        # Save Stats
+                        avg_latency = (total_latency / total_flows) * 1000 # to ms
+                        with open(STATS_FILE, 'w') as sf:
+                            json.dump({
+                                "accuracy": "N/A (Live)", 
+                                "latency": f"{avg_latency:.2f}", 
+                                "total": total_flows, 
+                                "threats": malicious_count, 
+                                "mode": "Live Sniffer"
+                            }, sf)
+                        
+                        # --- Filtered Alerting Logic ---
+                        if (prob >= MIN_CONFIDENCE or f['total_fwd_packets'] > 20) and f['src'] not in WHITELIST_IPS:
                             
                             # If forced by volume, set high confidence manually
+                            malicious_count += 1
                             if prob <= 0.5: 
                                 prob = 0.99
                                 top_feature = "FwdPkts"
@@ -193,12 +221,14 @@ def reporter():
                                 top_feature = feature_names[max_idx]
                                 impact_val = vals[max_idx]
                             
-                            print(f"{Fore.RED}🚨 ATTACK DETECTED! Type: {top_feature} | Src: {f['src']} | Pkts: {f['total_fwd_packets']}{Style.RESET_ALL}")
+                            print(f"{Fore.RED}ATTACK DETECTED! Type: {top_feature} | Src: {f['src']} | Pkts: {f['total_fwd_packets']}{Style.RESET_ALL}")
                             
                             timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
                             with open(LOG_FILE, 'a', newline='') as logf:
                                 writer = csv.writer(logf)
                                 writer.writerow([timestamp, f['src'], f['dst'], f"{prob:.2f}", top_feature, f"{impact_val:.2f}"])
+                        elif f['src'] in WHITELIST_IPS and (prob >= MIN_CONFIDENCE):
+                             print(f"{Fore.BLUE}Whitelisted Traffic: {f['src']} (Confidence: {prob:.2f}){Style.RESET_ALL}")
                         else:
                             # Print benign to confirm system is alive
                             print(f"{Fore.GREEN}Benign: {f['src']} -> {f['dst']} (Pkts: {f['total_fwd_packets']}){Style.RESET_ALL}")

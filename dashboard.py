@@ -3,13 +3,14 @@ import pandas as pd
 import altair as alt
 import time
 import os
+import json
 
 # 1. Page Config
 st.set_page_config(
     page_title="RT-XNIDS Monitor",
     page_icon="page_icon.png",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
 # 2. CSS Injection (Shadcn UI Dark Mode - Zinc)
@@ -23,7 +24,7 @@ st.markdown("""
     }
     
     /* Clean UI */
-    header[data-testid="stHeader"] {visibility: hidden;}
+    /* header[data-testid="stHeader"] {visibility: hidden;} */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     .block-container {padding-top: 2rem; padding-bottom: 2rem;}
@@ -133,12 +134,92 @@ def load_data():
     except:
         return pd.DataFrame(columns=["Timestamp", "SrcIP", "DstIP", "Confidence", "AttackReason", "ImpactScore"])
 
-# 5. Main Loop
+def load_system_stats():
+    STATS_FILE = "live_stats.json"
+    if not os.path.exists(STATS_FILE):
+        return {"accuracy": "0.00%", "latency": "0.00", "total": 0, "threats": 0, "mode": "Inactive"}
+    try:
+        with open(STATS_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return {"accuracy": "0.00%", "latency": "0.00", "total": 0, "threats": 0, "mode": "Inactive"}
+
+def get_human_explanation(attack_type, top_feature, confidence):
+    conf_pct = f"{float(confidence)*100:.0f}%" if confidence != "N/A" else "High"
+    
+    if top_feature in ['FwdPkts', 'BwdPkts', 'Total Fwd Packets', 'Total Backward Packets']:
+        return f"This device is sending a massive amount of traffic in a short time. This is typical of 'Flooding' or DDoS attacks trying to crash the network. (Confidence: {conf_pct})"
+    elif top_feature in ['Duration', 'Flow Duration']:
+        return f"The connection was kept open for a suspiciously long time, which often indicates a hacker maintaining a link to steal data (Command & Control). (Confidence: {conf_pct})"
+    elif top_feature in ['LenMean', 'LenStd', 'Fwd Packet Length Mean', 'Fwd Packet Length Std']:
+        return f"The data packets are unusually large or small. This often happens when hackers hide malicious code inside files or scan the network for vulnerabilities. (Confidence: {conf_pct})"
+    elif top_feature in ['IAT', 'Flow IAT Mean']:
+        return f"The traffic is arriving faster than a human could type (machine speed). This indicates an automated bot is attacking the system. (Confidence: {conf_pct})"
+    else:
+        return f"The AI detected an anomaly based on network patterns that deviate significantly from normal user behavior. (Confidence: {conf_pct})"
+
+# 5. Sidebar Configuration
+with st.sidebar:
+    st.header(":material/settings: Control Panel")
+    
+    # A. Sensitivity (Slider)
+    st.subheader("Defense Logic")
+    confidence_threshold = st.slider(
+        ":material/tune: Sensitivity", 
+        min_value=0.0, max_value=1.0, value=0.60, step=0.05,
+        help="Alerts below this confidence are ignored."
+    )
+    
+    # B. Attack Vector Filter (Multiselect)
+    # We pre-define common vectors to avoid loop glitches
+    known_vectors = ["FwdPkts", "BwdPkts", "Duration", "LenMean", "LenStd", "IAT"]
+    selected_vectors = st.multiselect(
+        ":material/filter_alt: Filter Attack Type",
+        options=known_vectors,
+        default=known_vectors,
+        help="Focus on specific types of attacks."
+    )
+
+    # C. View Settings
+    st.subheader("Dashboard View")
+    history_depth = st.select_slider(
+        ":material/history: History Depth",
+        options=[10, 25, 50, 100],
+        value=25,
+        help="How many recent alerts to show."
+    )
+    
+    refresh_rate = st.slider(
+        ":material/timer: Refresh Rate (s)", 
+        min_value=1, max_value=5, value=1
+    )
+    
+    st.divider()
+    st.markdown(":material/check_circle: System Status: **Active**")
+
+# 6. Main Loop Setup
 placeholder = st.empty()
 
 while True:
-    df = load_data()
+    df_raw = load_data()
     
+    # --- Logic: Apply Filters ---
+    # 1. Filter by Confidence
+    if not df_raw.empty:
+        df = df_raw[df_raw['Confidence'].astype(float) >= confidence_threshold]
+    else:
+        df = df_raw.copy()
+        
+    # 2. Filter by Attack Vector
+    if not df.empty and selected_vectors:
+        df = df[df['AttackReason'].isin(selected_vectors)]
+
+    # 3. Sort and Limit for "Recent Alerts" table
+    if not df.empty:
+        df_sorted = df.sort_index(ascending=False).head(history_depth)
+    else:
+        df_sorted = pd.DataFrame(columns=["Timestamp", "SrcIP", "DstIP", "Confidence", "AttackReason"])
+
     with placeholder.container():
         # Header
         st.markdown("""
@@ -151,10 +232,36 @@ while True:
             ">Network Security Monitor</h1>
         """, unsafe_allow_html=True)
         
+        # --- System Status Metrics ---
+        stats = load_system_stats()
+        with st.container():
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                st.metric(label=":material/dns: System Mode", value=stats["mode"])
+            with m2:
+                st.metric(label=":material/check_circle: Accuracy", value=stats["accuracy"])
+            with m3:
+                st.metric(label=":material/speed: Avg Latency", value=f"{stats['latency']} ms")
+            with m4:
+                st.metric(label=":material/query_stats: Processed Flows", value=f"{stats['total']:,}")
+        
+        st.markdown("<div style='height: 1rem; border-bottom: 1px solid #27272a; margin-bottom: 2rem;'></div>", unsafe_allow_html=True)
+
+        # --- Non-Technical Explainability ---
+        if not df.empty:
+            latest_threat = df.iloc[-1]
+            explanation = get_human_explanation(
+                latest_threat['AttackReason'], 
+                latest_threat['AttackReason'], 
+                latest_threat['Confidence']
+            )
+            
+            st.info(f"**Why did the AI block this?** (Threshold: {confidence_threshold:.2f})\n\n {explanation}", icon=":material/lightbulb:")
+            st.markdown("<div style='height: 1rem;'></div>", unsafe_allow_html=True)
+
         # Metrics
         total_threats = len(df)
         if not df.empty:
-            df_sorted = df.sort_index(ascending=False)
             last_target = df.iloc[-1]['DstIP']
             top_vector = df['AttackReason'].mode()[0] if not df['AttackReason'].empty else "N/A"
             high_conf = len(df[df['Confidence'] > 0.9])
@@ -164,7 +271,6 @@ while True:
             except:
                 last_ts = "N/A"
         else:
-            df_sorted = pd.DataFrame(columns=["Timestamp", "SrcIP", "DstIP", "Confidence", "AttackReason", "ImpactScore"])
             last_target = "Safe"
             top_vector = "None"
             high_conf = 0
@@ -185,7 +291,7 @@ while True:
         c_table, c_chart = st.columns([2, 1])
         
         with c_table:
-            st.markdown("<h3 style='font-size: 1rem; font-weight: 500; color: #fafafa; margin-bottom: 1rem;'>Live Threat Feed</h3>", unsafe_allow_html=True)
+            st.markdown(f"<h3 style='font-size: 1rem; font-weight: 500; color: #fafafa; margin-bottom: 1rem;'>Live Threat Feed (Last {history_depth})</h3>", unsafe_allow_html=True)
             table_html = generate_html_table(df_sorted)
             st.markdown(table_html, unsafe_allow_html=True)
             
@@ -203,8 +309,8 @@ while True:
                     strokeWidth=0
                 )
                 
-                st.altair_chart(chart) # Warning fixed by removing use_container_width
+                st.altair_chart(chart)
             else:
                 st.markdown("<div style='color: #a1a1aa; font-size: 0.875rem;'>Waiting for data...</div>", unsafe_allow_html=True)
     
-    time.sleep(1)
+    time.sleep(refresh_rate)

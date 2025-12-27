@@ -9,3 +9,5 @@ colorama
 joblib
 scapy
 Pillow
+seaborn
+matplotlib

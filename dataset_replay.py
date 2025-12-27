@@ -7,6 +7,7 @@ import joblib
 import shap
 import os
 import csv
+import json
 from colorama import Fore, Style, init
 
 # 1. Setup & Artifacts
@@ -19,6 +20,10 @@ DATASET_PATH = "datasets\CICIDS2017\Friday-WorkingHours-Afternoon-PortScan.pcap_
 MODEL_PATH = "nids_model.pth"
 SCALER_PATH = "scaler.pkl"
 LOG_FILE = "alerts.log"
+
+# --- Fine-Tuning (FP Reduction) ---
+MIN_CONFIDENCE = 0.60
+WHITELIST_IPS = ["127.0.0.1", "192.168.1.1"]
 
 # --- Feature Mapping ---
 MODEL_FEATURES = ["Duration", "FwdPkts", "BwdPkts", "LenMean", "LenStd", "IAT"]
@@ -72,7 +77,7 @@ class NIDSModel(nn.Module):
 def load_artifacts():
     try:
         if not os.path.exists(SCALER_PATH) or not os.path.exists(MODEL_PATH):
-            print(f"{Fore.RED}❌ Error: Model or Scaler file missing.{Style.RESET_ALL}")
+            print(f"{Fore.RED}Error: Model or Scaler file missing.{Style.RESET_ALL}")
             exit(1)
             
         scaler = joblib.load(SCALER_PATH)
@@ -85,7 +90,7 @@ def load_artifacts():
         explainer = shap.DeepExplainer(model, background_data)
         return model, scaler, explainer
     except Exception as e:
-        print(f"{Fore.RED}❌ Error loading artifacts: {e}{Style.RESET_ALL}")
+        print(f"{Fore.RED}Error loading artifacts: {e}{Style.RESET_ALL}")
         exit(1)
 
 def main():
@@ -94,20 +99,26 @@ def main():
 
     # 2. Data Ingestion
     if not os.path.exists(DATASET_PATH):
-        print(f"{Fore.RED}❌ Dataset file not found at: {DATASET_PATH}{Style.RESET_ALL}")
+        print(f"{Fore.RED}Dataset file not found at: {DATASET_PATH}{Style.RESET_ALL}")
         return
 
     print(f"{Fore.CYAN}Loading dataset from {DATASET_PATH}...{Style.RESET_ALL}")
+    total_flows = 0
+    correct_predictions = 0
+    total_latency = 0
+    malicious_count = 0
+    STATS_FILE = "live_stats.json"
+
     try:
         # Load Dataframe
         df = pd.read_csv(DATASET_PATH, nrows=None) 
         
         # --- FIX 1: Clean Column Names (Remove Spaces) ---
         df.columns = df.columns.str.strip()
-        print(f"{Fore.GREEN}✅ Dataset loaded: {len(df)} rows. Columns cleaned.{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}Dataset loaded: {len(df)} rows. Columns cleaned.{Style.RESET_ALL}")
         
     except Exception as e:
-        print(f"{Fore.RED}❌ Failed to read CSV: {e}{Style.RESET_ALL}")
+        print(f"{Fore.RED}Failed to read CSV: {e}{Style.RESET_ALL}")
         return
 
     # Ensure log file exists
@@ -116,7 +127,7 @@ def main():
             writer = csv.writer(f)
             writer.writerow(["Timestamp", "SrcIP", "DstIP", "Confidence", "AttackReason", "ImpactScore"])
 
-    print(f"{Fore.GREEN}✅ Simulation starting... (Ctrl+C to stop){Style.RESET_ALL}")
+    print(f"{Fore.GREEN}Simulation starting... (Ctrl+C to stop){Style.RESET_ALL}")
     
     # 3. Simulation Loop
     try:
@@ -142,6 +153,8 @@ def main():
             label_col = next((k for k, v in FEATURE_MAP.items() if v == "Label"), None)
             ground_truth = str(row[label_col]) if label_col and label_col in row else "UNKNOWN"
             
+            # --- Tracking ---
+            start_infer = time.time()
             # Inference
             X = np.array(feature_vector).reshape(1, -1)
             X_scaled = scaler.transform(X)
@@ -150,12 +163,36 @@ def main():
             with torch.no_grad():
                 output = model(X_tensor)
                 prob = output.item()
+            
+            end_infer = time.time()
+            infer_time = end_infer - start_infer
+            
+            total_flows += 1
+            total_latency += infer_time
 
             # Logic
             is_malicious_pred = prob > 0.5
             is_malicious_label = ground_truth.upper() not in ["BENIGN", "NORMAL", "0", "UNKNOWN"]
+            
+            if is_malicious_label: malicious_count += 1
+            if (is_malicious_pred == is_malicious_label):
+                correct_predictions += 1
+            
+            # Save Stats
+            accuracy = (correct_predictions / total_flows) * 100
+            avg_latency = (total_latency / total_flows) * 1000 # to ms
+            
+            with open(STATS_FILE, 'w') as sf:
+                json.dump({
+                    "accuracy": f"{accuracy:.2f}%", 
+                    "latency": f"{avg_latency:.2f}", 
+                    "total": total_flows, 
+                    "threats": malicious_count, 
+                    "mode": "Simulation"
+                }, sf)
 
-            if is_malicious_pred or is_malicious_label:
+            # --- Filtered Alerting Logic ---
+            if (is_malicious_pred or is_malicious_label) and prob >= MIN_CONFIDENCE and src_ip not in WHITELIST_IPS:
                 shap_values = explainer.shap_values(X_tensor)
                 vals = shap_values[0][0] if isinstance(shap_values, list) else shap_values[0]
                 max_idx = np.argmax(np.abs(vals))
@@ -166,12 +203,14 @@ def main():
 
                 # Log & Print
                 alert_color = Fore.RED if is_malicious_pred else Fore.YELLOW
-                print(f"{alert_color}🚨 ALERT [{ground_truth}] | Conf: {prob:.2f} | Reason: {top_feature} ({impact_val:.2f}) | Src: {src_ip}{Style.RESET_ALL}")
+                print(f"{alert_color}ALERT [{ground_truth}] | Conf: {prob:.2f} | Reason: {top_feature} ({impact_val:.2f}) | Src: {src_ip}{Style.RESET_ALL}")
                 
                 timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
                 with open(LOG_FILE, 'a', newline='') as logf:
                     writer = csv.writer(logf)
                     writer.writerow([timestamp, src_ip, dst_ip, f"{prob:.2f}", top_feature, f"{impact_val:.2f}"])
+            elif src_ip in WHITELIST_IPS and (is_malicious_pred or is_malicious_label):
+                 print(f"{Fore.BLUE}Whitelisted Traffic: {src_ip} (Confidence: {prob:.2f}){Style.RESET_ALL}")
             
             time.sleep(0.05)
 
