@@ -1,0 +1,11 @@
+scikit-learn
+pandas
+numpy
+torch
+streamlit
+altair
+shap
+colorama
+joblib
+scapy
+Pillow
