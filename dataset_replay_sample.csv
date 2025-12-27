@@ -1,0 +1,6 @@
+Flow Duration,Total Fwd Packets,Total Backward Packets,Fwd Packet Length Mean,Fwd Packet Length Std,Flow IAT Mean,Source IP,Destination IP,Label
+100,5,3,60.0,10.0,20.0,192.168.1.10,192.168.1.1,BENIGN
+500,2,1,40.0,5.0,200.0,192.168.1.11,192.168.1.1,BENIGN
+999999,50,0,1000.0,500.0,50.0,10.0.0.5,192.168.1.1,DDoS
+12345,10,10,100.0,20.0,1000.0,192.168.1.12,192.168.1.1,BENIGN
+50,100,0,0.0,0.0,1.0,10.0.0.6,192.168.1.1,PortScan
