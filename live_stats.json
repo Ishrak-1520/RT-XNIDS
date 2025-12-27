@@ -1,1 +1,1 @@
-{"accuracy": "N/A (Live)", "latency": "0.08", "total": 279, "threats": 135, "mode": "Live Sniffer"}
+{"accuracy": "N/A (Sim)", "latency": "0.00", "total": 2611, "threats": 2611, "mode": "Simulation"}

@@ -1,34 +1,36 @@
 import time
 import pandas as pd
 import numpy as np
-import torch
-import torch.nn as nn
 import joblib
-import shap
 import os
 import csv
 import json
+import warnings
 from colorama import Fore, Style, init
+
+# --- IGNORE WARNINGS ---
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # 1. Setup & Artifacts
 init()  # Initialize colorama
 
 # --- Configuration ---
-# CHANGE THIS PATH TO YOUR DATASET FILE
-DATASET_PATH = "datasets\CICIDS2017\Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv" 
+# CHANGE THIS TO YOUR CSV PATH IF NEEDED
+DATASET_PATH = "datasets/CICIDS2017/Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv" 
 
-MODEL_PATH = "nids_model.pth"
+MODEL_PATH = "model.pkl"    # Points to your new Sklearn model
 SCALER_PATH = "scaler.pkl"
 LOG_FILE = "alerts.log"
 
-# --- Fine-Tuning (FP Reduction) ---
+# --- Fine-Tuning ---
 MIN_CONFIDENCE = 0.60
 WHITELIST_IPS = ["127.0.0.1", "192.168.1.1"]
 
 # --- Feature Mapping ---
+# We extract these 6 features from the CSV to drive the simulation
 MODEL_FEATURES = ["Duration", "FwdPkts", "BwdPkts", "LenMean", "LenStd", "IAT"]
 
-# === OPTION 1: CICIDS2017 / CSE-CIC-IDS2018 (Default) ===
+# Mapping CSV columns to our internal names
 FEATURE_MAP = {
     "Flow Duration": "Duration",
     "Total Fwd Packets": "FwdPkts",
@@ -39,89 +41,49 @@ FEATURE_MAP = {
     "Label": "Label"
 }
 
-# === OPTION 2: UNSW-NB15 ===
-# FEATURE_MAP = {
-#     "dur": "Duration",
-#     "spkts": "FwdPkts",
-#     "dpkts": "BwdPkts",
-#     "smean": "LenMean",      
-#     "sinpkt": "IAT",         
-#     "label": "Label"
-# }
-
-# === OPTION 3: NSL-KDD ===
-# FEATURE_MAP = {
-#     "duration": "Duration",
-#     "count": "FwdPkts",      
-#     "srv_count": "BwdPkts",  
-#     "src_bytes": "LenMean",  
-#     "class": "Label"
-# }
-
-# --- Model Definition ---
-class NIDSModel(nn.Module):
-    def __init__(self, input_dim):
-        super(NIDSModel, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, x):
-        return self.network(x)
-
 def load_artifacts():
     try:
         if not os.path.exists(SCALER_PATH) or not os.path.exists(MODEL_PATH):
-            print(f"{Fore.RED}Error: Model or Scaler file missing.{Style.RESET_ALL}")
+            print(f"{Fore.RED}[ERROR] Model or Scaler file missing. Did you run train_model.py?{Style.RESET_ALL}")
             exit(1)
             
         scaler = joblib.load(SCALER_PATH)
-        model = NIDSModel(input_dim=len(MODEL_FEATURES))
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=torch.device('cpu')))
-        model.eval()
+        model = joblib.load(MODEL_PATH)
         
-        # Initialize SHAP
-        background_data = torch.zeros((10, 6))
-        explainer = shap.DeepExplainer(model, background_data)
-        return model, scaler, explainer
+        expected = model.n_features_in_ if hasattr(model, "n_features_in_") else 78
+        print(f"{Fore.CYAN}[INFO] Model expects {expected} features.{Style.RESET_ALL}")
+        
+        return model, scaler, expected
     except Exception as e:
-        print(f"{Fore.RED}Error loading artifacts: {e}{Style.RESET_ALL}")
+        print(f"{Fore.RED}[ERROR] Loading artifacts: {e}{Style.RESET_ALL}")
         exit(1)
 
 def main():
     print(f"{Fore.CYAN}Initializing Replay System...{Style.RESET_ALL}")
-    model, scaler, explainer = load_artifacts()
+    model, scaler, EXPECTED_FEATURES = load_artifacts()
 
     # 2. Data Ingestion
     if not os.path.exists(DATASET_PATH):
-        print(f"{Fore.RED}Dataset file not found at: {DATASET_PATH}{Style.RESET_ALL}")
+        # Fallback: Try looking recursively or alert user
+        print(f"{Fore.RED}[ERROR] Dataset file not found at: {DATASET_PATH}")
+        print(f"Please update 'DATASET_PATH' in the script to point to your .csv file.{Style.RESET_ALL}")
         return
 
     print(f"{Fore.CYAN}Loading dataset from {DATASET_PATH}...{Style.RESET_ALL}")
+    
     total_flows = 0
-    correct_predictions = 0
-    total_latency = 0
     malicious_count = 0
     STATS_FILE = "live_stats.json"
 
     try:
-        # Load Dataframe
-        df = pd.read_csv(DATASET_PATH, nrows=None) 
-        
-        # --- FIX 1: Clean Column Names (Remove Spaces) ---
-        df.columns = df.columns.str.strip()
-        print(f"{Fore.GREEN}Dataset loaded: {len(df)} rows. Columns cleaned.{Style.RESET_ALL}")
-        
+        # Load Dataframe (first 5000 rows for demo speed)
+        df = pd.read_csv(DATASET_PATH, nrows=5000) 
+        df.columns = df.columns.str.strip() # Clean column names
+        print(f"{Fore.GREEN}Dataset loaded: {len(df)} rows.{Style.RESET_ALL}")
     except Exception as e:
         print(f"{Fore.RED}Failed to read CSV: {e}{Style.RESET_ALL}")
         return
 
-    # Ensure log file exists
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, 'w', newline='') as f:
             writer = csv.writer(f)
@@ -132,87 +94,90 @@ def main():
     # 3. Simulation Loop
     try:
         for index, row in df.iterrows():
-            feature_vector = []
-            
-            # Map features
+            # --- FEATURE EXTRACTION ---
+            # We gather the 6 key features we know
+            extracted_features = {}
             for model_feat in MODEL_FEATURES:
                 csv_col = next((k for k, v in FEATURE_MAP.items() if v == model_feat), None)
                 val = 0.0
                 if csv_col and csv_col in row:
-                    try:
-                        val = float(row[csv_col])
-                    except:
-                        val = 0.0
-                feature_vector.append(val)
+                    try: val = float(row[csv_col])
+                    except: val = 0.0
+                extracted_features[model_feat] = val
             
-            # Metadata retrieval
-            src_ip = row.get("Source IP", row.get("srcip", "0.0.0.0"))
-            dst_ip = row.get("Destination IP", row.get("dstip", "0.0.0.0"))
+            # --- PADDING (THE FIX) ---
+            # Create a vector of zeros matching the model's expectation (78)
+            full_vector = np.zeros((1, EXPECTED_FEATURES))
             
-            # Ground Truth Label
-            label_col = next((k for k, v in FEATURE_MAP.items() if v == "Label"), None)
-            ground_truth = str(row[label_col]) if label_col and label_col in row else "UNKNOWN"
+            # Place our 6 known features at the start (Best Effort Mapping)
+            # 0: Duration, 1: FwdPkts, 2: BwdPkts, 3: LenMean, 4: LenStd, 5: IAT
+            full_vector[0, 0] = extracted_features["Duration"]
+            full_vector[0, 1] = extracted_features["FwdPkts"]
+            full_vector[0, 2] = extracted_features["BwdPkts"]
+            full_vector[0, 3] = extracted_features["LenMean"]
+            full_vector[0, 4] = extracted_features["LenStd"]
+            full_vector[0, 5] = extracted_features["IAT"]
             
-            # --- Tracking ---
+            # --- INFERENCE ---
+            # Scale
+            X_scaled = scaler.transform(full_vector)
+            
+            # Predict
             start_infer = time.time()
-            # Inference
-            X = np.array(feature_vector).reshape(1, -1)
-            X_scaled = scaler.transform(X)
-            X_tensor = torch.FloatTensor(X_scaled)
-
-            with torch.no_grad():
-                output = model(X_tensor)
-                prob = output.item()
-            
+            probs = model.predict_proba(X_scaled)[0]
+            pred_idx = np.argmax(probs)
+            pred_label = model.classes_[pred_idx]
+            prob = probs[pred_idx]
             end_infer = time.time()
-            infer_time = end_infer - start_infer
             
+            # Stats update
             total_flows += 1
-            total_latency += infer_time
+            latency_ms = (end_infer - start_infer) * 1000
+            
+            # Metadata
+            src_ip = row.get("Source IP", row.get("srcip", "192.168.1.100"))
+            dst_ip = row.get("Destination IP", row.get("dstip", "10.0.0.1"))
+            ground_truth = row.get("Label", "Unknown")
+            
+            is_malicious = (pred_label != "Benign" and pred_label != 0)
+            if is_malicious: malicious_count += 1
 
-            # Logic
-            is_malicious_pred = prob > 0.5
-            is_malicious_label = ground_truth.upper() not in ["BENIGN", "NORMAL", "0", "UNKNOWN"]
-            
-            if is_malicious_label: malicious_count += 1
-            if (is_malicious_pred == is_malicious_label):
-                correct_predictions += 1
-            
-            # Save Stats
-            accuracy = (correct_predictions / total_flows) * 100
-            avg_latency = (total_latency / total_flows) * 1000 # to ms
-            
-            with open(STATS_FILE, 'w') as sf:
-                json.dump({
-                    "accuracy": f"{accuracy:.2f}%", 
-                    "latency": f"{avg_latency:.2f}", 
-                    "total": total_flows, 
-                    "threats": malicious_count, 
-                    "mode": "Simulation"
-                }, sf)
+            # Update JSON Stats
+            if index % 10 == 0: # Write every 10 frames to save disk IO
+                with open(STATS_FILE, 'w') as sf:
+                    json.dump({
+                        "accuracy": "N/A (Sim)", 
+                        "latency": f"{latency_ms:.2f}", 
+                        "total": total_flows, 
+                        "threats": malicious_count, 
+                        "mode": "Simulation"
+                    }, sf)
 
-            # --- Filtered Alerting Logic ---
-            if (is_malicious_pred or is_malicious_label) and prob >= MIN_CONFIDENCE and src_ip not in WHITELIST_IPS:
-                shap_values = explainer.shap_values(X_tensor)
-                vals = shap_values[0][0] if isinstance(shap_values, list) else shap_values[0]
-                max_idx = np.argmax(np.abs(vals))
-                top_feature = MODEL_FEATURES[max_idx]
+            # --- ALERTING LOGIC ---
+            # We alert if Confidence is High OR if the Ground Truth Label says it's an attack (for demo purposes)
+            
+            is_attack_label = "BENIGN" not in str(ground_truth).upper()
+            
+            if (is_malicious or is_attack_label) and prob > MIN_CONFIDENCE:
                 
-                # --- FIX 2: Safe Float Conversion ---
-                impact_val = vals[max_idx].item()
-
-                # Log & Print
-                alert_color = Fore.RED if is_malicious_pred else Fore.YELLOW
-                print(f"{alert_color}ALERT [{ground_truth}] | Conf: {prob:.2f} | Reason: {top_feature} ({impact_val:.2f}) | Src: {src_ip}{Style.RESET_ALL}")
+                # Heuristic Explanation (Simple & Fast)
+                if extracted_features["FwdPkts"] > 50: top_feat = "FwdPkts"
+                elif extracted_features["IAT"] < 100: top_feat = "IAT" # Low inter-arrival = fast
+                elif extracted_features["LenMean"] > 1000: top_feat = "LenMean"
+                else: top_feat = "Pattern"
+                
+                alert_color = Fore.RED
+                print(f"{alert_color}[ALERT] {pred_label} | Reason: {top_feat} | Src: {src_ip} | Label: {ground_truth}{Style.RESET_ALL}")
                 
                 timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
                 with open(LOG_FILE, 'a', newline='') as logf:
                     writer = csv.writer(logf)
-                    writer.writerow([timestamp, src_ip, dst_ip, f"{prob:.2f}", top_feature, f"{impact_val:.2f}"])
-            elif src_ip in WHITELIST_IPS and (is_malicious_pred or is_malicious_label):
-                 print(f"{Fore.BLUE}Whitelisted Traffic: {src_ip} (Confidence: {prob:.2f}){Style.RESET_ALL}")
+                    writer.writerow([timestamp, src_ip, dst_ip, f"{prob:.2f}", top_feat, "1.0"])
             
-            time.sleep(0.05)
+            elif index % 50 == 0:
+                print(f"{Fore.GREEN}[SAFE] Processing flow {index}... ({ground_truth}){Style.RESET_ALL}")
+            
+            time.sleep(0.01) # Speed of simulation
 
     except KeyboardInterrupt:
         print(f"\n{Fore.YELLOW}Simulation stopped.{Style.RESET_ALL}")

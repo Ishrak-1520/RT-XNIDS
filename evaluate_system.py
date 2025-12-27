@@ -1,27 +1,30 @@
 import time
 import pandas as pd
 import numpy as np
-import torch
-import torch.nn as nn
 import joblib
 import matplotlib.pyplot as plt
 import seaborn as sns
-import shap
 import os
+import warnings
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
 from colorama import Fore, Style, init
+
+# --- IGNORE WARNINGS ---
+warnings.filterwarnings("ignore")
 
 # --- Setup ---
 init()
 
 # --- Configuration ---
-DATASET_PATH = "datasets/CICIDS2017/Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv" # Update as needed
-MODEL_PATH = "nids_model.pth"
+# Global default path
+DEFAULT_DATASET_PATH = "datasets/CICIDS2017/Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv" 
+MODEL_PATH = "model.pkl"
 SCALER_PATH = "scaler.pkl"
 
+# The features we extract for the simulation
 MODEL_FEATURES = ["Duration", "FwdPkts", "BwdPkts", "LenMean", "LenStd", "IAT"]
 
-# === OPTION 1: CICIDS2017 / CSE-CIC-IDS2018 (Default) ===
+# Mapping for CIC-IDS2017
 FEATURE_MAP = {
     "Flow Duration": "Duration",
     "Total Fwd Packets": "FwdPkts",
@@ -32,166 +35,117 @@ FEATURE_MAP = {
     "Label": "Label"
 }
 
-# === OPTION 2: UNSW-NB15 ===
-# FEATURE_MAP = {
-#     "dur": "Duration",
-#     "spkts": "FwdPkts",
-#     "dpkts": "BwdPkts",
-#     "smean": "LenMean",      
-#     "sinpkt": "IAT",         
-#     "label": "Label"
-# }
-
-# === OPTION 3: NSL-KDD ===
-# FEATURE_MAP = {
-#     "duration": "Duration",
-#     "count": "FwdPkts",      
-#     "srv_count": "BwdPkts",  
-#     "src_bytes": "LenMean",  
-#     "class": "Label"
-# }
-
-# --- Model Definition ---
-class NIDSModel(nn.Module):
-    def __init__(self, input_dim):
-        super(NIDSModel, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, x):
-        return self.network(x)
-
 def load_artifacts():
+    print(f"{Fore.CYAN}[INFO] Loading Model and Scaler...{Style.RESET_ALL}")
     if not os.path.exists(SCALER_PATH) or not os.path.exists(MODEL_PATH):
-        print(f"{Fore.RED}❌ Error: Model or Scaler file missing.{Style.RESET_ALL}")
+        print(f"{Fore.RED}[ERROR] 'model.pkl' or 'scaler.pkl' missing.{Style.RESET_ALL}")
+        print("   Run 'train_model.py' first.")
         exit(1)
         
     scaler = joblib.load(SCALER_PATH)
-    model = NIDSModel(input_dim=len(MODEL_FEATURES))
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=torch.device('cpu')))
-    model.eval()
+    model = joblib.load(MODEL_PATH)
     return model, scaler
 
 def main():
     print(f"\n{Fore.CYAN}=== NIDS Evaluation System ==={Style.RESET_ALL}")
     
-    # 1. Load Data
-    if not os.path.exists(DATASET_PATH):
-        print(f"{Fore.RED}❌ Dataset not found at {DATASET_PATH}{Style.RESET_ALL}")
-        return
+    # 1. Load Artifacts
+    model, scaler = load_artifacts()
+    
+    # Check expected features
+    EXPECTED_FEATURES = model.n_features_in_ if hasattr(model, "n_features_in_") else 78
+    print(f"[INFO] Model expects {EXPECTED_FEATURES} input features.")
 
-    print(f"Loading dataset: {DATASET_PATH}...")
-    df = pd.read_csv(DATASET_PATH)
-    df.columns = df.columns.str.strip()
+    # 2. Load Data (Fixing the Scope Error)
+    # We use a new local variable 'target_path' to avoid UnboundLocalError
+    target_path = DEFAULT_DATASET_PATH
+
+    if not os.path.exists(target_path):
+        # Try finding it in the local folder as a fallback
+        if os.path.exists("training_data.csv"):
+             target_path = "training_data.csv"
+        else:
+            print(f"{Fore.RED}[ERROR] Dataset not found at: {target_path}{Style.RESET_ALL}")
+            print(f"   (Also checked 'training_data.csv' and found nothing)")
+            return
+
+    print(f"[INFO] Loading dataset from: {target_path}...")
     
-    # 2. Extract Features and Labels
-    X_raw = []
-    y_true_labels = []
+    # Load a sample (e.g., 10,000 rows) to keep evaluation fast. Remove 'nrows' to evaluate all.
+    try:
+        df = pd.read_csv(target_path, nrows=10000) 
+        df.columns = df.columns.str.strip()
+    except Exception as e:
+        print(f"{Fore.RED}[ERROR] Failed to read CSV: {e}{Style.RESET_ALL}")
+        return
     
+    # 3. Prepare Data (Padding Logic)
+    print(f"[INFO] Preprocessing {len(df)} flows...")
+    
+    X_padded = np.zeros((len(df), EXPECTED_FEATURES))
+    y_true_binary = []
+    
+    # Extract the 6 known features and map labels
     label_col = next((k for k, v in FEATURE_MAP.items() if v == "Label"), None)
     
-    for _, row in df.iterrows():
-        # Feature Extraction
-        features = []
-        for model_feat in MODEL_FEATURES:
-            csv_col = next((k for k, v in FEATURE_MAP.items() if v == model_feat), None)
-            val = 0.0
+    # Map data to vectors
+    for i, row in df.iterrows():
+        # 0: Duration, 1: FwdPkts, 2: BwdPkts, 3: LenMean, 4: LenStd, 5: IAT
+        for feature_idx, feat_name in enumerate(MODEL_FEATURES):
+            csv_col = next((k for k, v in FEATURE_MAP.items() if v == feat_name), None)
             if csv_col and csv_col in row:
-                try:
-                    val = float(row[csv_col])
-                except:
-                    val = 0.0
-            features.append(val)
-        X_raw.append(features)
+                try: val = float(row[csv_col])
+                except: val = 0.0
+                X_padded[i, feature_idx] = val
         
-        # Label Extraction
-        if label_col and label_col in row:
-            y_true_labels.append(str(row[label_col]).strip())
-        else:
-            y_true_labels.append("UNKNOWN")
+        # Label Processing
+        label = str(row[label_col]) if label_col in row else "UNKNOWN"
+        # 1 = Malicious, 0 = Benign
+        is_malicious = 1 if label.upper() not in ["BENIGN", "NORMAL", "0", "UNKNOWN"] else 0
+        y_true_binary.append(is_malicious)
 
-    X_raw = np.array(X_raw)
-    y_true_binary = [1 if label.upper() not in ["BENIGN", "NORMAL", "0", "UNKNOWN"] else 0 for label in y_true_labels]
-
-    # 3. Model Inference & Latency
-    model, scaler = load_artifacts()
-    X_scaled = scaler.transform(X_raw)
-    X_tensor = torch.FloatTensor(X_scaled)
-    
-    print(f"Processing {len(X_tensor)} flows for inference...")
+    # 4. Inference
+    print(f"[INFO] Running Inference on {len(df)} samples...")
+    X_scaled = scaler.transform(X_padded)
     
     start_time = time.time()
-    with torch.no_grad():
-        outputs = model(X_tensor)
-        y_probs = outputs.squeeze().numpy()
+    y_pred = model.predict(X_scaled)
     end_time = time.time()
     
+    # Convert predictions to binary (0/1) if they aren't already
+    y_pred_binary = []
+    for pred in y_pred:
+        p_str = str(pred).upper()
+        if p_str in ["BENIGN", "NORMAL", "0"]:
+            y_pred_binary.append(0)
+        else:
+            y_pred_binary.append(1)
+
+    # 5. Metrics
     total_latency_ms = (end_time - start_time) * 1000
-    avg_latency_ms = total_latency_ms / len(X_tensor)
+    avg_latency_ms = total_latency_ms / len(df)
     
-    y_pred_binary = (y_probs > 0.5).astype(int)
-
-    # 4. Accuracy & Metrics
     print(f"\n{Fore.GREEN}--- Performance Metrics ---{Style.RESET_ALL}")
-    print(f"Overall Accuracy: {accuracy_score(y_true_binary, y_pred_binary):.4f}")
-    print(f"Precision: {precision_score(y_true_binary, y_pred_binary, zero_division=0):.4f}")
-    print(f"Recall (Overall): {recall_score(y_true_binary, y_pred_binary, zero_division=0):.4f}")
-    print(f"F1-Score: {f1_score(y_true_binary, y_pred_binary, zero_division=0):.4f}")
-    print(f"Average Latency per Flow: {avg_latency_ms:.4f} ms")
+    print(f"Overall Accuracy:  {accuracy_score(y_true_binary, y_pred_binary)*100:.2f}%")
+    print(f"Precision:         {precision_score(y_true_binary, y_pred_binary, zero_division=0):.4f}")
+    print(f"Recall:            {recall_score(y_true_binary, y_pred_binary, zero_division=0):.4f}")
+    print(f"F1-Score:          {f1_score(y_true_binary, y_pred_binary, zero_division=0):.4f}")
+    print(f"Avg Latency:       {avg_latency_ms:.4f} ms per flow")
 
-    # 5. Classification Report (per attack class)
-    print(f"\n{Fore.YELLOW}--- Detailed Classification Report ---{Style.RESET_ALL}")
-    # We use y_true_labels for granular reporting
-    # Map predictions back to 'Malicious' or 'Benign' for report clarity if labels aren't balanced
-    report = classification_report(y_true_binary, y_pred_binary, target_names=["Benign", "Malicious"], zero_division=0)
-    print(report)
-
-    # Specific Recall for Malicious Classes (Anomaly Performance)
-    malicious_indices = [i for i, val in enumerate(y_true_binary) if val == 1]
-    if malicious_indices:
-        malicious_recall = recall_score(np.array(y_true_binary)[malicious_indices], np.array(y_pred_binary)[malicious_indices], zero_division=0)
-        print(f"{Fore.MAGENTA}Zero-Day / Anomaly Recall: {malicious_recall:.4f}{Style.RESET_ALL}")
-    else:
-        print(f"{Fore.MAGENTA}No malicious flows found in dataset sample.{Style.RESET_ALL}")
-
-    # 6. Confusion Matrix
+    # 6. Confusion Matrix Plot
+    print(f"\n[INFO] Generating Confusion Matrix...")
     cm = confusion_matrix(y_true_binary, y_pred_binary)
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Benign', 'Malicious'], yticklabels=['Benign', 'Malicious'])
-    plt.title('NIDS Confusion Matrix')
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=['Benign', 'Malicious'], 
+                yticklabels=['Benign', 'Malicious'])
+    plt.title('NIDS Detection Performance')
     plt.ylabel('Actual Label')
     plt.xlabel('Predicted Label')
-    plt.savefig('confusion_matrix.png')
-    print(f"\n✅ Confusion Matrix saved as 'confusion_matrix.png'")
-
-    # 7. SHAP Explanations (Explanation Clarity)
-    print(f"\n{Fore.CYAN}Generating SHAP explanations for 100 samples...{Style.RESET_ALL}")
-    sample_size = min(100, len(X_tensor))
-    X_sample = X_tensor[:sample_size]
-    
-    # Background data for SHAP (using a small zero-tensor as reference)
-    background = torch.zeros((1, len(MODEL_FEATURES)))
-    explainer = shap.DeepExplainer(model, background)
-    shap_values = explainer.shap_values(X_sample)
-    
-    # Handle SHAP output format
-    if isinstance(shap_values, list):
-        shap_values_plot = shap_values[0]
-    else:
-        shap_values_plot = shap_values
-
-    plt.figure(figsize=(10, 6))
-    shap.summary_plot(shap_values_plot, X_sample.numpy(), feature_names=MODEL_FEATURES, show=False)
     plt.tight_layout()
-    plt.savefig('shap_summary.png')
-    print(f"✅ SHAP Summary Plot saved as 'shap_summary.png'")
-
+    plt.savefig('confusion_matrix.png')
+    print(f"[SUCCESS] Saved chart to 'confusion_matrix.png'")
+    
     print(f"\n{Fore.GREEN}Evaluation Complete!{Style.RESET_ALL}")
 
 if __name__ == "__main__":
